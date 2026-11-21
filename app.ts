@@ -581,6 +581,10 @@ interface Repo {
   pulls: Pull[];
   nextNumber: number;
   nextCommentId: number;
+  /** Bumped whenever repo.objects gains an entry; fetch responses are cached against it. */
+  packVersion: number;
+  /** One-entry cache of the last upload-pack response (key = parsed fetch args). */
+  fetchCache: { key: string; version: number; body: Buffer } | null;
 }
 
 const reposByName = new Map<string, Repo>();
@@ -608,6 +612,8 @@ function createRepoRecord(name: string, description: string, priv: boolean): Rep
     pulls: [],
     nextNumber: 1,
     nextCommentId: 1,
+    packVersion: 0,
+    fetchCache: null,
   };
   reposByName.set(name, repo);
   return repo;
@@ -637,7 +643,10 @@ function repoForOwner(name: string, owner: string): Repo | null {
 
 function storeObject(repo: Repo, type: ObjType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) {
+    repo.objects.set(oid, { type, data });
+    repo.packVersion += 1;
+  }
   return oid;
 }
 
@@ -1291,6 +1300,12 @@ function handleFetchV2(repo: Repo, args: string[]): Buffer {
     else if (arg.startsWith('shallow ')) shallowIn.push(arg.slice(8).trim());
     else if (arg.startsWith('deepen ')) depth = Number.parseInt(arg.slice(7).trim(), 10);
   }
+  // The response is a pure function of the parsed fetch args and the object
+  // store; identical fetches (e.g. 50 concurrent shallow clones of one tip)
+  // reuse the built pack instead of re-walking and re-deflating it.
+  const cacheKey = `v2|${wants.join(',')}|${haves.join(',')}|${shallowIn.join(',')}|${depth}`;
+  const cachedV2 = repo.fetchCache;
+  if (cachedV2 !== null && cachedV2.key === cacheKey && cachedV2.version === repo.packVersion) return cachedV2.body;
   const plan = planFetch(repo, wants, haves, shallowIn, depth);
   const pack = writePack(plan.objects);
   const parts: Buffer[] = [];
@@ -1306,7 +1321,9 @@ function handleFetchV2(repo: Repo, args: string[]): Buffer {
   parts.push(pktLine('packfile\n'));
   parts.push(sidebandPack(pack));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const bodyV2 = Buffer.concat(parts);
+  repo.fetchCache = { key: cacheKey, version: repo.packVersion, body: bodyV2 };
+  return bodyV2;
 }
 
 function handleFetchV0(repo: Repo, lines: string[]): Buffer {
@@ -1321,6 +1338,9 @@ function handleFetchV0(repo: Repo, lines: string[]): Buffer {
     else if (text.startsWith('shallow ')) shallowIn.push(text.slice(8).trim());
     else if (text.startsWith('deepen ')) depth = Number.parseInt(text.slice(7).trim(), 10);
   }
+  const cacheKey = `v0|${wants.join(',')}|${haves.join(',')}|${shallowIn.join(',')}|${depth}`;
+  const cachedV0 = repo.fetchCache;
+  if (cachedV0 !== null && cachedV0.key === cacheKey && cachedV0.version === repo.packVersion) return cachedV0.body;
   const plan = planFetch(repo, wants, haves, shallowIn, depth);
   const pack = writePack(plan.objects);
   const parts: Buffer[] = [pktLine('NAK\n')];
@@ -1329,7 +1349,9 @@ function handleFetchV0(repo: Repo, lines: string[]): Buffer {
   parts.push(PKT_FLUSH);
   parts.push(sidebandPack(pack));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const bodyV0 = Buffer.concat(parts);
+  repo.fetchCache = { key: cacheKey, version: repo.packVersion, body: bodyV0 };
+  return bodyV0;
 }
 
 function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repo, body: Buffer): void {
@@ -1403,7 +1425,10 @@ function handleReceivePack(req: IncomingMessage, res: ServerResponse, repo: Repo
     try {
       const pack = readPack(body.subarray(flushEnd), (oid) => repo.objects.get(oid));
       for (const [oid, object] of pack.objects) {
-        if (!repo.objects.has(oid)) repo.objects.set(oid, object);
+        if (!repo.objects.has(oid)) {
+          repo.objects.set(oid, object);
+          repo.packVersion += 1;
+        }
       }
     } catch (err) {
       unpackOk = false;
